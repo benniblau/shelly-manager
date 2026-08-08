@@ -13,23 +13,43 @@ import time
 class ShellyDeviceManager:
     """Manager class for discovering and managing Shelly devices."""
     
-    def __init__(self, debug=False, auto_update=False, include_beta=False):
+    def __init__(self, debug=False, auto_update=False, include_beta=False, networks=None):
         self.devices: List[Dict] = []
         self.timeout = 5.0
         self.concurrent_limit = 50
         self.debug = debug
         self.auto_update = auto_update
         self.include_beta = include_beta
-        
+        # Explicit ranges to scan instead of the locally attached ones. Needed when
+        # the devices live on a routed subnet this host is not itself part of.
+        self.networks = list(networks) if networks else []
+        # How long to wait for a device to come back on the new firmware, and how
+        # often to look. A Shelly OTA plus reboot takes well under two minutes.
+        self.verify_timeout = 240
+        self.verify_interval = 10
+        self.update_batch_size = 5
+        # A stalled OTA is often transient, so retry once after a reboot.
+        self.update_attempts = 2
+
     def debug_print(self, message):
         """Print debug message if debug mode is enabled."""
         if self.debug:
             print(f"DEBUG: {message}")
         
     def get_local_networks(self) -> List[str]:
-        """Get all local network ranges from available interfaces."""
+        """Get the network ranges to scan.
+
+        Explicitly configured ranges win: interface discovery only ever sees
+        directly attached subnets, so devices on a routed subnet are invisible
+        to it even when they are perfectly reachable.
+        """
+        if self.networks:
+            for network in self.networks:
+                print(f"Scanning configured network: {network}")
+            return self.networks
+
         networks = []
-        
+
         try:
             # Get all network interfaces
             interfaces = netifaces.interfaces()
@@ -51,6 +71,8 @@ class ShellyDeviceManager:
                             try:
                                 # Create network from IP and netmask
                                 network = ipaddress.IPv4Network(f"{ip}/{netmask}", strict=False)
+                                if str(network) in networks:
+                                    continue  # several interfaces can share a subnet
                                 networks.append(str(network))
                                 print(f"Found network: {network}")
                             except ValueError:
@@ -70,8 +92,12 @@ class ShellyDeviceManager:
             url = f"http://{ip}/shelly"
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=self.timeout)) as response:
                 if response.status == 200:
-                    data = await response.json()
-                    
+                    # content_type=None: judge the payload, not the declared mimetype,
+                    # so a device serving JSON as text/html is still recognised.
+                    data = await response.json(content_type=None)
+                    if not isinstance(data, dict):
+                        return None
+
                     # Debug: Print raw response for first few devices
                     self.debug_print(f"Raw /shelly response from {ip}: {data}")
                     
@@ -104,6 +130,7 @@ class ShellyDeviceManager:
                             'discoverable': data.get('discoverable', True),
                             'auth': data.get('auth', False),
                             'gen': data.get('gen', 1),  # Default to Gen1 if not specified
+                            'slot': data.get('slot'),  # active flash slot (Gen2+)
                             'device_data': data
                         }
                         
@@ -206,11 +233,11 @@ class ShellyDeviceManager:
         # Try Gen2+ devices first (newer API) if it's Gen2 or Gen3
         if generation >= 2:
             try:
-                url = f"http://{device_ip}/rpc/Shelly.CheckForUpdate"
-                async with session.post(url, json={"id": 1, "method": "Shelly.CheckForUpdate"}, 
+                url = f"http://{device_ip}/rpc"
+                async with session.post(url, json={"id": 1, "method": "Shelly.CheckForUpdate"},
                                       timeout=aiohttp.ClientTimeout(total=self.timeout)) as response:
                     if response.status == 200:
-                        data = await response.json()
+                        data = await response.json(content_type=None)
                         self.debug_print(f"Gen2+ update response for {device_name}: {data}")
                         if 'result' in data:
                             return {'format': 'gen2', 'data': data['result']}
@@ -336,6 +363,7 @@ class ShellyDeviceManager:
                             if has_update:
                                 new_version = update_data.get('new_version', 'Unknown')
                                 current_version = device.get('ver', device.get('fw', 'Unknown'))
+                                device['available_version'] = new_version
                                 print(f"🔄 UPDATE AVAILABLE: {new_version} (current: {current_version})")
                             else:
                                 print(f"✅ Up to date: {device.get('ver', device.get('fw', 'Unknown'))}")
@@ -345,6 +373,7 @@ class ShellyDeviceManager:
                             if status == 'pending' or 'update' in status.lower():
                                 has_update = True
                                 new_version = update_data.get('new_version', update_data.get('version', 'Unknown'))
+                                device['available_version'] = new_version
                                 print(f"🔄 UPDATE AVAILABLE: {new_version} (current: {device.get('ver', device.get('fw', 'Unknown'))})")
                             else:
                                 print(f"✅ Up to date: {device.get('ver', device.get('fw', 'Unknown'))}")
@@ -358,6 +387,7 @@ class ShellyDeviceManager:
                                     current_version = device.get('ver', device.get('fw', 'Unknown'))
                                     if new_version != current_version:
                                         has_update = True
+                                        device['available_version'] = new_version
                                         print(f"🔄 UPDATE AVAILABLE: {new_version} (current: {current_version})")
                                         found_update = True
                                         break
@@ -374,6 +404,7 @@ class ShellyDeviceManager:
                                     if update_section.get('has_update') or update_section.get('available'):
                                         has_update = True
                                         new_version = update_section.get('new_version', update_section.get('version', 'Unknown'))
+                                        device['available_version'] = new_version
                                         print(f"🔄 UPDATE AVAILABLE: {new_version} (current: {device.get('ver', device.get('fw', 'Unknown'))})")
                                         break
                         if not has_update:
@@ -386,167 +417,254 @@ class ShellyDeviceManager:
                     print("❌ Could not check for updates")
                     device['has_update'] = False
     
-    async def install_update(self, session: aiohttp.ClientSession, device: Dict) -> bool:
+    @staticmethod
+    def _rpc_error(data) -> Optional[Tuple[int, str]]:
+        """Extract (code, message) from an RPC error, or None if there is no error.
+
+        Errors come back in two shapes depending on the endpoint used:
+        POST /rpc nests them under 'error', POST /rpc/<Method> returns them flat.
         """
-        Install firmware update on a device.
-        
-        Note: Gen3 devices may return "Already in progress" error which indicates
-        the update was successfully initiated. Some Gen3 devices also return None
-        as response data which is treated as success.
+        if not isinstance(data, dict):
+            return None
+        error = data.get('error') if isinstance(data.get('error'), dict) else None
+        if error is None and 'code' in data and 'message' in data:
+            error = data
+        if error is None:
+            return None
+        return error.get('code'), str(error.get('message', 'Unknown error'))
+
+    async def install_update(self, session: aiohttp.ClientSession, device: Dict) -> Dict:
+        """Ask a device to start installing a firmware update.
+
+        Returns {'accepted': bool, 'reason': str}. Note that 'accepted' only means
+        the device took the request - it does NOT mean the firmware was installed.
+        A Shelly answers HTTP 200 with a null result the moment the OTA starts, and
+        an OTA that later fails is never reported back over the API, so the caller
+        must confirm the outcome with verify_update().
         """
         device_ip = device['ip']
         device_name = device['name']
         generation = device.get('gen', 1)
-        
+
         try:
             if generation >= 2:
-                # Gen2+ update installation
-                url = f"http://{device_ip}/rpc/Shelly.Update"
-                
-                # Determine which version stage to use based on include_beta flag
-                stage = "beta" if self.include_beta else "stable"
+                # The JSON-RPC envelope has to go to /rpc. Posting it to
+                # /rpc/Shelly.Update makes the device read the whole envelope as the
+                # params object, so 'stage' would be dropped and it would always
+                # fall back to stable.
+                url = f"http://{device_ip}/rpc"
+
+                # Use the channel the update was actually detected on, so that
+                # --include-beta does not request a beta build on a device that only
+                # has a stable one on offer.
+                stage = device.get('available_version_type') or ("beta" if self.include_beta else "stable")
                 payload = {"id": 1, "method": "Shelly.Update", "params": {"stage": stage}}
-                
+
                 self.debug_print(f"Installing {stage} update for {device_name}")
-                
-                async with session.post(url, json=payload, 
+
+                async with session.post(url, json=payload,
                                       timeout=aiohttp.ClientTimeout(total=30)) as response:
-                    if response.status == 200:
-                        try:
-                            data = await response.json()
-                        except Exception as json_error:
-                            self.debug_print(f"JSON parsing error for {device_name}: {json_error}")
-                            # If JSON parsing fails, assume success if HTTP 200
-                            print(f"✅ Update initiated for {device_name} (response not JSON)")
-                            return True
-                            
-                        self.debug_print(f"Gen2+ update install response for {device_name}: {data}")
-                        
-                        # Handle case where response is None (some Gen3 devices)
-                        if data is None:
-                            print(f"✅ Update initiated for {device_name} (no response data)")
-                            return True
-                        
-                        # Check for errors in the response
-                        if isinstance(data, dict) and 'error' in data and data['error'] is not None:
-                            error_info = data['error']
-                            error_message = error_info.get('message', 'Unknown error') if isinstance(error_info, dict) else str(error_info)
-                            print(f"❌ Update failed for {device_name}: {error_message}")
-                            return False
-                        elif isinstance(data, dict) and 'result' in data and data['result'] is not False:
-                            print(f"✅ Update initiated for {device_name}")
-                            return True
-                        else:
-                            print(f"✅ Update initiated for {device_name} (assuming success)")
-                            return True  # Some devices don't return explicit success
-                    elif response.status == 500:
-                        # Handle specific Gen2+/Gen3 error cases
-                        try:
-                            error_data = await response.json()
-                            if isinstance(error_data, dict):
-                                error_code = error_data.get('code')
-                                error_message = error_data.get('message', 'Unknown error')
-                                
-                                if error_code == -106 and 'already in progress' in error_message.lower():
-                                    print(f"✅ Update already in progress for {device_name}")
-                                    return True
-                                elif error_code == -114 and 'no update info' in error_message.lower():
-                                    print(f"❌ Update failed for {device_name}: No update info available (try running update check first)")
-                                    return False
-                                else:
-                                    print(f"❌ Update failed for {device_name}: {error_message} (code {error_code})")
-                                    return False
-                        except:
-                            pass
-                        print(f"❌ Update request failed for {device_name}: HTTP {response.status}")
-                        return False
-                    else:
-                        print(f"❌ Update request failed for {device_name}: HTTP {response.status}")
-                        return False
+                    try:
+                        data = await response.json(content_type=None)
+                    except Exception as json_error:
+                        self.debug_print(f"JSON parsing error for {device_name}: {json_error}")
+                        return {'accepted': False,
+                                'reason': f'unreadable response (HTTP {response.status})'}
+
+                    self.debug_print(f"Gen2+ update install response for {device_name}: {data}")
+
+                    error = self._rpc_error(data)
+                    if error:
+                        code, message = error
+                        if code == -106 and 'already in progress' in message.lower():
+                            # An OTA is running. That is not a success by itself -
+                            # it is also what a device stuck in a failed OTA says.
+                            return {'accepted': True, 'reason': 'update already in progress'}
+                        if code == -114 and 'no update info' in message.lower():
+                            return {'accepted': False,
+                                    'reason': 'no update info available on the device'}
+                        return {'accepted': False, 'reason': f'{message} (code {code})'}
+
+                    if response.status != 200:
+                        return {'accepted': False, 'reason': f'HTTP {response.status}'}
+
+                    return {'accepted': True, 'reason': 'OTA started'}
             else:
                 # Gen1 update installation
-                url = f"http://{device_ip}/ota/start"
-                async with session.post(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                url = f"http://{device_ip}/ota?update=true"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
                     if response.status == 200:
-                        data = await response.json()
+                        data = await response.json(content_type=None)
                         self.debug_print(f"Gen1 update install response for {device_name}: {data}")
-                        return True
-                    else:
-                        print(f"❌ Update request failed for {device_name}: HTTP {response.status}")
-                        return False
-                    
+                        return {'accepted': True, 'reason': 'OTA started'}
+                    return {'accepted': False, 'reason': f'HTTP {response.status}'}
+
         except Exception as e:
-            print(f"❌ Error installing update for {device_name}: {e}")
-            
+            return {'accepted': False, 'reason': f'{type(e).__name__}: {e}'}
+
+    async def reboot_device(self, session: aiohttp.ClientSession, device: Dict) -> bool:
+        """Reboot a Gen2+ device and wait for it to answer again."""
+        if device.get('gen', 1) < 2:
+            return False
+        try:
+            async with session.post(f"http://{device['ip']}/rpc",
+                                    json={"id": 1, "method": "Shelly.Reboot"},
+                                    timeout=aiohttp.ClientTimeout(total=15)) as response:
+                await response.read()
+        except Exception as e:
+            self.debug_print(f"Reboot request failed for {device['name']}: {e}")
+            return False
+
+        for _ in range(12):
+            await asyncio.sleep(5)
+            try:
+                async with session.get(f"http://{device['ip']}/shelly",
+                                       timeout=aiohttp.ClientTimeout(total=self.timeout)) as response:
+                    await response.json(content_type=None)
+                return True
+            except Exception:
+                continue
         return False
-    
-    async def bulk_update_devices(self) -> None:
-        """Install updates on all devices that have updates available."""
+
+    async def verify_update(self, session: aiohttp.ClientSession, device: Dict,
+                            target_version: str) -> Tuple[bool, str]:
+        """Poll a device until it actually runs target_version.
+
+        A successful OTA reboots the device, so it normally disappears for a while
+        and comes back on the new version. A device that answers the whole time on
+        the old version has silently aborted the update.
+        """
+        deadline = time.time() + self.verify_timeout
+        observed = device.get('ver', 'Unknown')
+        went_away = False
+
+        while time.time() < deadline:
+            await asyncio.sleep(self.verify_interval)
+            try:
+                url = f"http://{device['ip']}/shelly"
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=self.timeout)) as response:
+                    data = await response.json(content_type=None)
+                observed = data.get('ver', observed)
+                device['slot'] = data.get('slot', device.get('slot'))
+                if observed == target_version:
+                    return True, observed
+            except Exception:
+                # Unreachable is expected while it reboots into the new firmware.
+                went_away = True
+                self.debug_print(f"{device['name']} unreachable while updating (rebooting?)")
+
+        if went_away:
+            return False, f"{observed} (rebooted but did not reach {target_version})"
+        return False, observed
+
+
+    async def bulk_update_devices(self) -> Dict:
+        """Install updates on all devices that have updates available.
+
+        Returns counts of what really happened, so a caller (cron) can tell a clean
+        run from one where devices were left behind.
+        """
         devices_with_updates = [d for d in self.devices if d.get('has_update', False)]
-        
+
         if not devices_with_updates:
             print("\n✅ No devices need updates!")
-            return
-            
+            return {'updated': 0, 'stalled': 0, 'rejected': 0}
+
+
         print(f"\n🔄 Installing updates on {len(devices_with_updates)} device(s)...")
         print("⚠️  This process may take several minutes as devices will reboot during updates.\n")
         
-        connector = aiohttp.TCPConnector(limit=5)  # Limit concurrent updates
+        connector = aiohttp.TCPConnector(limit=self.update_batch_size * 4)
+        updated, stalled, rejected = [], [], []
+
+        async def update_one(index: int, device: Dict) -> None:
+            device_name = device['name']
+            current_version = device.get('ver', device.get('fw', 'Unknown'))
+            target_version = device.get('available_version', 'Unknown')
+
+            print(f"[{index}/{len(devices_with_updates)}] Updating {device_name} "
+                  f"({current_version} → {target_version})...")
+
+            observed = current_version
+            for attempt in range(1, self.update_attempts + 1):
+                result = await self.install_update(session, device)
+                if not result['accepted']:
+                    print(f"❌ {device_name}: update refused - {result['reason']}")
+                    rejected.append((device_name, device, result['reason']))
+                    return
+
+                ok, observed = await self.verify_update(session, device, target_version)
+                if ok:
+                    print(f"✅ {device_name}: now running {observed}")
+                    device['ver'] = observed
+                    device['has_update'] = False
+                    updated.append(device_name)
+                    return
+
+                print(f"❌ {device_name}: still on {observed} after {self.verify_timeout}s "
+                      f"(attempt {attempt}/{self.update_attempts}) - the device accepted the "
+                      f"OTA but did not install it")
+                if attempt < self.update_attempts:
+                    # A half-finished OTA can leave the device holding memory it never
+                    # frees, so give it a clean start before trying again.
+                    print(f"   ↻ rebooting {device_name} and retrying...")
+                    await self.reboot_device(session, device)
+
+            stalled.append((device_name, device, observed))
+
         async with aiohttp.ClientSession(connector=connector) as session:
-            success_count = 0
-            failed_devices = []
-            
-            for i, device in enumerate(devices_with_updates, 1):
-                device_name = device['name']
-                current_version = device.get('ver', device.get('fw', 'Unknown'))
-                generation = device.get('gen', 1)
-                
-                print(f"[{i}/{len(devices_with_updates)}] Updating {device_name} (v{current_version})...")
-                
-                # For Gen3 devices, refresh update info right before updating to avoid "No update info" error
-                if generation >= 2:
-                    self.debug_print(f"Refreshing update info for {device_name} before update")
-                    fresh_update_info = await self.check_for_updates(session, device)
-                    if fresh_update_info and fresh_update_info.get('data'):
-                        self.debug_print(f"Fresh update info for {device_name}: {fresh_update_info}")
-                    else:
-                        print(f"⚠️  No fresh update info found for {device_name}, proceeding anyway...")
-                
-                success = await self.install_update(session, device)
-                if success:
-                    print(f"✅ Update initiated for {device_name}")
-                    success_count += 1
-                    
-                    # Wait a bit between updates to avoid overwhelming the network
-                    if i < len(devices_with_updates):
-                        await asyncio.sleep(2)
-                else:
-                    print(f"❌ Failed to update {device_name}")
-                    failed_devices.append(device_name)
-        
+            # Update in batches: each device is verified before its slot in the batch
+            # is reused, so the summary reflects what really happened rather than
+            # what was merely requested.
+            for start in range(0, len(devices_with_updates), self.update_batch_size):
+                batch = devices_with_updates[start:start + self.update_batch_size]
+                await asyncio.gather(*(update_one(start + n + 1, device)
+                                       for n, device in enumerate(batch)))
+
         print(f"\n📊 Bulk update summary:")
-        print(f"   ✅ {success_count} device(s) update initiated successfully")
-        print(f"   ❌ {len(devices_with_updates) - success_count} device(s) failed to update")
-        
-        if failed_devices:
-            print(f"\n❌ Failed devices:")
-            for device_name in failed_devices:
-                print(f"   • {device_name}")
-            print(f"\nNote: Some failures are normal if devices are already up to date or have")
-            print(f"restrictions. Check individual device status for more details.")
-        
-        if success_count > 0:
-            print(f"\n⏳ Devices are now updating and will reboot automatically.")
-            print(f"   This process typically takes 2-5 minutes per device.")
-            print(f"   You can run the scan again in a few minutes to verify updates.")
-            
+        print(f"   ✅ {len(updated)} device(s) verified on the new firmware")
+        print(f"   ❌ {len(stalled)} device(s) accepted the update but never installed it")
+        print(f"   ❌ {len(rejected)} device(s) refused the update request")
+
+        if rejected:
+            print(f"\n❌ Update request refused:")
+            for device_name, _device, reason in rejected:
+                print(f"   • {device_name}: {reason}")
+
+        if stalled:
+            print(f"\n❌ Update accepted but not installed:")
+            for device_name, device, observed in stalled:
+                print(f"   • {device_name} ({device['ip']}) still on {observed} "
+                      f"after {self.update_attempts} attempt(s)")
+
+            print(f"\n   These devices take the OTA request, download the firmware and then")
+            print(f"   abort without rebooting. The device reports nothing about the failure,")
+            print(f"   which is why an unverified run looks like it succeeded.")
+            print(f"   Try again later - the download can also fail transiently - and if a")
+            print(f"   device keeps refusing, flash it locally via its web UI")
+            print(f"   (Settings → Firmware → upload) or replace it.")
+
+        if updated:
+            print(f"\n⏳ {len(updated)} device(s) rebooted onto the new firmware.")
+
+        return {'updated': len(updated), 'stalled': len(stalled), 'rejected': len(rejected)}
+
     async def prompt_for_bulk_update(self) -> bool:
         """Prompt user for bulk update confirmation."""
         devices_with_updates = [d for d in self.devices if d.get('has_update', False)]
-        
+
         if not devices_with_updates:
             return False
-            
+
+        # Without a terminal there is nobody to answer, and silently doing nothing
+        # is how an unattended run pretends to work. Say so instead.
+        if not self.auto_update and not sys.stdin.isatty():
+            print(f"\n⚠️  {len(devices_with_updates)} device(s) need updates, but there is no "
+                  f"terminal to confirm on.")
+            print("   Pass --auto-update to install them unattended (e.g. from cron).")
+            return False
+
+
         # Auto-update mode - skip prompt
         if self.auto_update:
             print(f"\n🔄 Auto-update mode enabled - installing updates on {len(devices_with_updates)} device(s)...")
@@ -562,11 +680,8 @@ class ShellyDeviceManager:
             update_info = device.get('update_info', {})
             update_data = update_info.get('data', {})
             
-            if update_info.get('format') == 'gen2' and 'stable' in update_data:
-                new_version = update_data['stable'].get('version', 'Unknown')
-            else:
-                new_version = update_data.get('new_version', 'Unknown')
-                
+            new_version = device.get('available_version') or update_data.get('new_version', 'Unknown')
+
             print(f"  • {device['name']} ({device['type']})")
             print(f"    Current: v{current_version} → Available: v{new_version}")
         
@@ -633,24 +748,33 @@ class ShellyDeviceManager:
             if self.include_beta:
                 print("   (Checked both stable and beta versions)")
     
-    async def run(self) -> None:
-        """Run the complete device discovery and update check process."""
+    async def run(self) -> int:
+        """Run the complete device discovery and update check process.
+
+        Returns a process exit code: 0 when there is nothing left to do, 1 when
+        devices were left un-updated, 2 when no devices were found at all. This is
+        what makes an unattended run monitorable - cron only notices failures if
+        they show up in the exit status.
+        """
         print("Shelly Device Manager")
         print("====================")
-        
+
         start_time = time.time()
-        
+
         # Discover devices
         await self.discover_devices()
-        
+
         if not self.devices:
             print("\n❌ No Shelly devices found on the network.")
             print("\nTroubleshooting:")
             print("1. Make sure Shelly devices are connected to the same network")
             print("2. Check that devices are powered on and connected to WiFi")
             print("3. Verify devices are not in AP mode")
-            return
-        
+            print("4. If the devices are on a routed subnet this host is not part of,")
+            print("   name it explicitly: -n 10.10.2.0/24")
+            return 2
+
+
         # Get detailed information and check for updates
         await self.get_device_details()
         
@@ -658,11 +782,17 @@ class ShellyDeviceManager:
         self.print_summary()
         
         # Prompt for bulk update if updates are available
+        outcome = None
         if await self.prompt_for_bulk_update():
-            await self.bulk_update_devices()
-        
+            outcome = await self.bulk_update_devices()
+
         elapsed_time = time.time() - start_time
         print(f"\n⏱️  Scan completed in {elapsed_time:.1f} seconds")
+
+        if outcome is not None:
+            return 1 if (outcome['stalled'] or outcome['rejected']) else 0
+        # Nothing was installed: that is only fine if nothing needed installing.
+        return 1 if any(d.get('has_update') for d in self.devices) else 0
 
 
 async def main():
@@ -673,16 +803,27 @@ async def main():
     parser.add_argument('-t', '--timeout', type=float, default=5.0,
                        help='HTTP request timeout in seconds (default: 5.0)')
     parser.add_argument('--auto-update', action='store_true',
-                       help='Automatically install updates without user confirmation (use with caution)')
+                       help='Install updates without asking. This is the flag to use for '
+                            'unattended runs such as cron; without it a run with no terminal '
+                            'only reports what it would have done')
     parser.add_argument('--include-beta', action='store_true',
                        help='Include beta/development versions when checking for updates')
-    
+    parser.add_argument('-n', '--network', action='append', metavar='CIDR',
+                       help='Network range to scan, e.g. 10.10.2.0/24. May be repeated. '
+                            'Required when the devices are on a routed subnet this host '
+                            'is not part of, since interface discovery cannot see those.')
+    parser.add_argument('--verify-timeout', type=int, default=240,
+                       help='Seconds to wait for a device to come back on the new '
+                            'firmware before calling the update failed (default: 240)')
+
     args = parser.parse_args()
-    
+
     try:
-        manager = ShellyDeviceManager(debug=args.debug, auto_update=args.auto_update, include_beta=args.include_beta)
+        manager = ShellyDeviceManager(debug=args.debug, auto_update=args.auto_update,
+                                      include_beta=args.include_beta, networks=args.network)
         manager.timeout = args.timeout
-        
+        manager.verify_timeout = args.verify_timeout
+
         if args.debug:
             print("🐛 Debug mode enabled - showing detailed API responses")
         if args.auto_update:
@@ -690,9 +831,10 @@ async def main():
         if args.include_beta:
             print("🧪 Beta mode enabled - including beta/development versions")
             
-        await manager.run()
+        sys.exit(await manager.run())
     except KeyboardInterrupt:
         print("\n\n❌ Scan interrupted by user")
+        sys.exit(130)
     except Exception as e:
         print(f"\n❌ An error occurred: {e}")
         if args.debug:

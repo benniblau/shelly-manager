@@ -65,8 +65,53 @@ python app.py --auto-update
 # Include beta/development versions when checking for updates
 python app.py --include-beta
 
+# Scan a specific network range (repeatable)
+python app.py -n 10.10.2.0/24
+
+# Wait longer for a device to come back on the new firmware
+python app.py --auto-update --verify-timeout 300
+
 # Combine options
 python app.py --debug --timeout 3 --auto-update --include-beta
+```
+
+### Unattended / cron
+
+`--auto-update` is the flag that removes all interaction: it installs the updates
+without prompting. Combine it with `-n` so discovery does not depend on which
+interfaces the cron user happens to see:
+
+```cron
+# Check for Shelly firmware updates every night at 03:30
+30 3 * * * cd /Users/benjaminblau/Documents/vscode/shelly-manager && .venv/bin/python app.py -n 10.10.2.0/24 --auto-update >> /var/log/shelly-manager.log 2>&1
+```
+
+The exit status tells you whether the run was clean, so cron (or any monitoring)
+notices when devices are left behind:
+
+| Code | Meaning |
+| ---- | ------- |
+| `0`  | Nothing to do, or every update was verified on the new firmware |
+| `1`  | Devices still need updating: an update failed, or updates were found but not installed |
+| `2`  | No Shelly devices were found at all (wrong network range, or a connectivity problem) |
+| `130`| Interrupted |
+
+Run without `--auto-update` and with no terminal attached, the app reports what
+needs updating and exits `1` rather than silently doing nothing.
+
+Because each device is verified, a cron run takes as long as the slowest update
+rather than returning immediately. Budget a few minutes; `--verify-timeout`
+bounds how long a single device may take.
+
+### Scanning a routed subnet
+
+Automatic discovery uses `netifaces`, which only ever sees subnets this host is
+directly attached to. If the devices live on a different subnet that is merely
+routed (a separate IoT VLAN, for example), discovery finds nothing and you must
+name the range explicitly:
+
+```bash
+python app.py -n 10.10.2.0/24 --auto-update
 ```
 
 ### Bulk Updates
@@ -177,18 +222,30 @@ SHELLY DEVICE SUMMARY (2 device(s) found)
 2. **Device Discovery**: Asynchronously scans each IP address in the network ranges, looking for devices that respond to `http://[ip]/shelly`
 3. **Device Verification**: Validates that responding devices are actual Shelly devices by checking the response format
 4. **Status Retrieval**: Fetches detailed status information from `http://[ip]/status`
-5. **Update Checking**: Uses both Gen2+ (`/rpc/Shelly.CheckForUpdate`) and Gen1 (`/ota/check`) APIs to check for updates
-6. **Bulk Updates**: Uses Gen2+ (`/rpc/Shelly.Update`) and Gen1 (`/ota/start`) APIs to install updates
+5. **Update Checking**: Uses both Gen2+ (`Shelly.CheckForUpdate`) and Gen1 (`/ota/check`) APIs to check for updates
+6. **Bulk Updates**: Uses Gen2+ (`Shelly.Update`) and Gen1 (`/ota?update=true`) APIs to install updates
+
+Gen2+ RPC calls are posted as a JSON-RPC envelope to `/rpc`. This matters: posting
+the same envelope to `/rpc/<Method>` makes the device read the whole envelope as
+the *params* object, so arguments such as `stage` are silently dropped.
 
 ## Update Process
 
 When you choose to install updates:
 
 1. **Safety Checks**: The app verifies update availability before proceeding
-2. **Sequential Updates**: Updates are installed one device at a time to avoid network overload
+2. **Batched Updates**: Devices are updated a few at a time to avoid network overload
 3. **Reboot Management**: Devices automatically reboot during the update process
-4. **Progress Tracking**: Real-time status updates show which devices are being updated
-5. **Error Handling**: Failed updates are reported with detailed error messages
+4. **Verification**: After triggering an update the app polls the device until it
+   actually reports the new firmware version. This is essential - a Shelly answers
+   the update request the moment the OTA *starts*, and an OTA that later fails is
+   never reported back, so an unverified run reports success for devices that never
+   updated
+5. **Retry**: A device that accepts the update but does not install it is rebooted
+   and retried once
+6. **Error Handling**: The summary distinguishes devices that were verified on the
+   new firmware, devices that accepted the update but never installed it, and
+   devices that refused the request
 
 **Important**: During updates, devices will:
 - Temporarily lose network connectivity
@@ -208,27 +265,24 @@ You can modify the following parameters in the `ShellyDeviceManager` class:
 
 **Common update scenarios:**
 
-- **Gen3 "Already in Progress"**: Normal response indicating update was successfully initiated
-- **HTTP 500 Error**: Device may already be up to date or temporarily busy  
+- **"Accepted the update but did not install it"**: The device took the OTA request,
+  downloaded the firmware and then aborted without rebooting. It reports nothing
+  about the failure. This is usually transient - the app reboots the device and
+  retries once - but a device that keeps doing it needs a local flash
+- **"Already in progress"**: An OTA is running. This is *not* proof of success: a
+  device stuck in a failed OTA answers the same way, which is why the outcome is
+  always verified against the reported firmware version
 - **Connection Timeout**: Device might be rebooting or network congested
-- **Update Failed**: Device might have restrictions or insufficient storage
 - **No Response**: Device could be in AP mode or disconnected
 - **"No update info available"**: Device may need manual update check first
-
-**Gen3 Device Specific Notes:**
-
-Gen3 (Mini 1PM G3) devices have unique update behavior:
-- May return "Already in progress" which indicates successful update initiation
-- Sometimes return empty response data (treated as success)
-- Require fresh update check before installation in some cases
-- The application automatically handles these Gen3-specific behaviors
 
 **Solutions:**
 
 1. **Retry Later**: Wait 5-10 minutes and run the scan again
-2. **Individual Updates**: Update devices one at a time instead of bulk
+2. **Individual Updates**: Target one device with `-n 10.10.2.6/32`
 3. **Check Network**: Ensure stable WiFi connection for all devices
-4. **Manual Update**: Use the Shelly app for problematic devices
+4. **Manual Update**: Flash locally via the device web UI (Settings → Firmware →
+   upload), or use the Shelly app for problematic devices
 
 ### Discovery Issues
 
