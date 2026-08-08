@@ -27,7 +27,10 @@ class ShellyDeviceManager:
         # often to look. A Shelly OTA plus reboot takes well under two minutes.
         self.verify_timeout = 240
         self.verify_interval = 10
-        self.update_batch_size = 5
+        # Updating several devices at once measurably hurts: in a 16-device run with
+        # a batch size of 5, exactly one device per batch completed. Default to one
+        # at a time and let the caller trade reliability for speed.
+        self.update_batch_size = 1
         # A stalled OTA is often transient, so retry once after a reboot.
         self.update_attempts = 2
 
@@ -521,6 +524,9 @@ class ShellyDeviceManager:
                 async with session.get(f"http://{device['ip']}/shelly",
                                        timeout=aiohttp.ClientTimeout(total=self.timeout)) as response:
                     await response.json(content_type=None)
+                # Answering HTTP does not mean it has WiFi and cloud access back
+                # yet, and it needs those to fetch update info and firmware.
+                await asyncio.sleep(10)
                 return True
             except Exception:
                 continue
@@ -587,6 +593,13 @@ class ShellyDeviceManager:
 
             observed = current_version
             for attempt in range(1, self.update_attempts + 1):
+                # A Shelly keeps the result of Shelly.CheckForUpdate in RAM and
+                # forgets it when it reboots, after which Shelly.Update answers
+                # -114 "No update info". Refresh before every attempt so a retry
+                # after a reboot has something to install.
+                if device.get('gen', 1) >= 2:
+                    await self.check_for_updates(session, device)
+
                 result = await self.install_update(session, device)
                 if not result['accepted']:
                     print(f"❌ {device_name}: update refused - {result['reason']}")
@@ -815,6 +828,10 @@ async def main():
     parser.add_argument('--verify-timeout', type=int, default=240,
                        help='Seconds to wait for a device to come back on the new '
                             'firmware before calling the update failed (default: 240)')
+    parser.add_argument('--batch-size', type=int, default=1,
+                       help='How many devices to update simultaneously (default: 1). '
+                            'Raising this is faster but noticeably less reliable - '
+                            'concurrent OTA downloads tend to stall')
 
     args = parser.parse_args()
 
@@ -823,6 +840,7 @@ async def main():
                                       include_beta=args.include_beta, networks=args.network)
         manager.timeout = args.timeout
         manager.verify_timeout = args.verify_timeout
+        manager.update_batch_size = max(1, args.batch_size)
 
         if args.debug:
             print("🐛 Debug mode enabled - showing detailed API responses")
