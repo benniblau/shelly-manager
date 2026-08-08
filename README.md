@@ -71,6 +71,9 @@ python app.py -n 10.10.2.0/24
 # Wait longer for a device to come back on the new firmware
 python app.py --auto-update --verify-timeout 300
 
+# Update several devices simultaneously (faster, but less reliable)
+python app.py --auto-update --batch-size 3
+
 # Combine options
 python app.py --debug --timeout 3 --auto-update --include-beta
 ```
@@ -99,9 +102,16 @@ notices when devices are left behind:
 Run without `--auto-update` and with no terminal attached, the app reports what
 needs updating and exits `1` rather than silently doing nothing.
 
-Because each device is verified, a cron run takes as long as the slowest update
-rather than returning immediately. Budget a few minutes; `--verify-timeout`
-bounds how long a single device may take.
+Because each device is verified, a cron run takes as long as the updates really
+take rather than returning immediately, and devices are updated one at a time by
+default. Budget roughly a minute per device that needs updating; `--verify-timeout`
+bounds how long a single device may take, and `--batch-size` trades reliability
+for speed.
+
+Updating devices concurrently is measurably worse: across a 16-device run with
+`--batch-size 5`, exactly one device per batch completed, and devices reported as
+failed there updated on the first try when run one at a time. Leave it at 1 unless
+you have a reason.
 
 ### Scanning a routed subnet
 
